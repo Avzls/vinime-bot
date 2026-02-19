@@ -1,0 +1,20 @@
+{
+  "name": "vinime-bot",
+  "version": "1.0.0",
+  "description": "Bot Telegram untuk nonton anime - powered by Telegraf & Vercel",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "node dev.js",
+    "start": "node api/webhook.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "dotenv": "^17.3.1"
+  }
+}
