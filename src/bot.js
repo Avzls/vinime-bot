@@ -1,165 +1,236 @@
 /**
  * Bot.js — Telegraf bot setup (webhook mode)
  * Semua command dan callback handler
+ * Parse mode: HTML (lebih stabil dari MarkdownV2)
+ *
+ * Video & gambar di-download dulu lalu di-upload ke Telegram,
+ * karena Telegram Bot API tidak bisa fetch langsung dari CDN anime.
  */
 
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf, Input } = require('telegraf');
+const { Readable } = require('stream');
 const api = require('./api');
 const {
   formatAnimeList,
+  formatAnimeListAZ,
   formatAnimeDetail,
   buildAnimeListKeyboard,
+  buildAnimeListAZKeyboard,
+  buildEpisodeKeyboard,
   buildDetailKeyboard,
   buildMainMenuKeyboard,
   getWelcomeMessage,
-  escapeMarkdown,
+  escapeHTML,
 } = require('./helpers');
 
-const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
+const bot = new Telegraf(process.env.TELEGRAM_TOKEN, {
+  // Support Local Bot API Server untuk upload file >50MB (sampai 2GB)
+  ...(process.env.TELEGRAM_API_ROOT && {
+    telegram: {
+      apiRoot: process.env.TELEGRAM_API_ROOT,
+    },
+  }),
+});
+
+// Cek apakah pakai Local Bot API (support file >50MB)
+const isLocalAPI = !!process.env.TELEGRAM_API_ROOT;
+const MAX_UPLOAD_MB = isLocalAPI ? 2000 : 50; // 2GB vs 50MB
+console.log(`📡 Telegram API: ${isLocalAPI ? process.env.TELEGRAM_API_ROOT + ' (Local, max 2GB)' : 'api.telegram.org (max 50MB)'}`);
+
+// ============================================================
+// DOWNLOAD HELPER
+// ============================================================
+
+/**
+ * Download file dari URL ke Buffer
+ * Supports file sampai ~2GB (tergantung memory)
+ * @param {string} url
+ * @param {number} maxSizeMB - Max file size in MB (0 = unlimited)
+ * @returns {{ buffer: Buffer, size: number, contentType: string } | null}
+ */
+async function downloadFile(url, maxSizeMB = 0) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 300000); // 5 min timeout
+
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Referer': 'https://otakudesu.best/',
+      },
+      redirect: 'follow',
+    });
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      console.error(`Download error: ${res.status} for ${url}`);
+      return null;
+    }
+
+    const contentType = res.headers.get('content-type') || '';
+    const contentLength = parseInt(res.headers.get('content-length') || '0');
+
+    // Cek ukuran file sebelum download (jika diketahui)
+    if (maxSizeMB > 0 && contentLength > maxSizeMB * 1024 * 1024) {
+      console.log(`File too large: ${(contentLength / 1024 / 1024).toFixed(1)}MB > ${maxSizeMB}MB`);
+      return { buffer: null, size: contentLength, contentType, tooLarge: true };
+    }
+
+    const arrayBuffer = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // Cek ukuran setelah download
+    if (maxSizeMB > 0 && buffer.length > maxSizeMB * 1024 * 1024) {
+      return { buffer: null, size: buffer.length, contentType, tooLarge: true };
+    }
+
+    return { buffer, size: buffer.length, contentType, tooLarge: false };
+  } catch (err) {
+    console.error(`Download failed for ${url}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Format file size ke string readable
+ */
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
 
 // ============================================================
 // COMMANDS
 // ============================================================
 
-/**
- * /start — Pesan sambutan + tombol menu
- */
-bot.start(async (ctx) => {
+bot.command('start', async (ctx) => {
   try {
-    await ctx.replyWithMarkdownV2(getWelcomeMessage(), {
+    await ctx.reply(getWelcomeMessage(), {
+      parse_mode: 'HTML',
       reply_markup: { inline_keyboard: buildMainMenuKeyboard() },
     });
   } catch (err) {
     console.error('Error /start:', err.message);
-    await ctx.reply('❌ Terjadi kesalahan. Silakan coba lagi.');
+    await ctx.reply('🎌 Selamat datang di VinimeBot!\n\nGunakan menu di bawah:', {
+      reply_markup: { inline_keyboard: buildMainMenuKeyboard() },
+    });
   }
 });
 
-/**
- * /terbaru — Anime terbaru
- */
 bot.command('terbaru', async (ctx) => {
-  await handleAnimeList(ctx, 'latest', '🆕 *Anime Terbaru:*\n\n', '🆕');
+  await handleAnimeList(ctx, 'latest', '🆕 <b>Anime Terbaru:</b>\n\n', '🆕');
 });
 
-/**
- * /rekomendasi — Anime rekomendasi
- */
 bot.command('rekomendasi', async (ctx) => {
-  await handleAnimeList(ctx, 'rec', '⭐ *Anime Rekomendasi:*\n\n', '⭐');
+  await handleAnimeList(ctx, 'rec', '⭐ <b>Anime Rekomendasi:</b>\n\n', '⭐');
 });
 
-/**
- * /movie — Daftar movie
- */
 bot.command('movie', async (ctx) => {
-  await handleAnimeList(ctx, 'movie', '🎥 *Daftar Movie Anime:*\n\n', '🎥');
+  await handleAnimeList(ctx, 'movie', '🎥 <b>Daftar Movie Anime:</b>\n\n', '🎥');
 });
 
-/**
- * /cari <judul> — Cari anime
- */
+bot.command('list', async (ctx) => {
+  await handleAnimeListAZ(ctx, 0);
+});
+
 bot.command('cari', async (ctx) => {
   const query = ctx.message.text.split(' ').slice(1).join(' ').trim();
   if (!query) {
-    return ctx.replyWithMarkdownV2(
-      '🔍 Gunakan format: `/cari judul anime`\n\nContoh: `/cari naruto`',
+    return ctx.reply(
+      '🔍 Gunakan format:\n<code>/cari judul anime</code>\n\nContoh: <code>/cari naruto</code>',
+      { parse_mode: 'HTML' },
     );
   }
   await handleSearch(ctx, query, 0);
 });
 
 // ============================================================
-// CALLBACK QUERY HANDLERS
+// CALLBACK QUERIES
 // ============================================================
 
 bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery.data;
 
   try {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery().catch(() => {});
 
-    // --- Menu utama ---
+    // Menu utama
     if (data === 'menu') {
-      await ctx.editMessageText(getWelcomeMessage(), {
-        parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: buildMainMenuKeyboard() },
-      });
-      return;
+      return await editOrReply(ctx, getWelcomeMessage(), buildMainMenuKeyboard());
     }
 
-    // --- Command dari tombol menu ---
+    // Command dari tombol menu
     if (data === 'cmd_terbaru') {
-      await handleAnimeListEdit(ctx, 'latest', '🆕 *Anime Terbaru:*\n\n', '🆕', 0);
-      return;
+      return await handleAnimeListEdit(ctx, 'latest', '🆕 <b>Anime Terbaru:</b>\n\n', '🆕', 0);
     }
     if (data === 'cmd_rekomendasi') {
-      await handleAnimeListEdit(ctx, 'rec', '⭐ *Anime Rekomendasi:*\n\n', '⭐', 0);
-      return;
+      return await handleAnimeListEdit(ctx, 'rec', '⭐ <b>Anime Rekomendasi:</b>\n\n', '⭐', 0);
     }
     if (data === 'cmd_movie') {
-      await handleAnimeListEdit(ctx, 'movie', '🎥 *Daftar Movie Anime:*\n\n', '🎥', 0);
-      return;
+      return await handleAnimeListEdit(ctx, 'movie', '🎥 <b>Daftar Movie Anime:</b>\n\n', '🎥', 0);
+    }
+    if (data === 'cmd_listaz') {
+      return await handleAnimeListAZEdit(ctx, 0);
     }
     if (data === 'cmd_cari') {
-      await ctx.editMessageText(
-        '🔍 Silakan ketik perintah:\n`/cari judul anime`\n\nContoh: `/cari naruto`',
-        { parse_mode: 'MarkdownV2' },
+      return await editOrReply(ctx,
+        '🔍 Silakan ketik perintah:\n<code>/cari judul anime</code>\n\nContoh: <code>/cari naruto</code>',
+        [],
       );
-      return;
     }
+    if (data === 'noop') return;
 
-    // --- Pagination ---
-    const pageMatch = data.match(/^(latest|rec|movie)_page_(\d+)$/);
+    // Pagination: latest_p_0, rec_p_1, movie_p_2
+    const pageMatch = data.match(/^(latest|rec|movie)_p_(\d+)$/);
     if (pageMatch) {
       const prefix = pageMatch[1];
       const page = parseInt(pageMatch[2]);
       const emojiMap = { latest: '🆕', rec: '⭐', movie: '🎥' };
       const titleMap = {
-        latest: '🆕 *Anime Terbaru:*\n\n',
-        rec: '⭐ *Anime Rekomendasi:*\n\n',
-        movie: '🎥 *Daftar Movie Anime:*\n\n',
+        latest: '🆕 <b>Anime Terbaru:</b>\n\n',
+        rec: '⭐ <b>Anime Rekomendasi:</b>\n\n',
+        movie: '🎥 <b>Daftar Movie Anime:</b>\n\n',
       };
-      await handleAnimeListEdit(ctx, prefix, titleMap[prefix], emojiMap[prefix], page);
-      return;
+      return await handleAnimeListEdit(ctx, prefix, titleMap[prefix], emojiMap[prefix], page);
     }
 
-    // --- Search pagination ---
-    const searchPageMatch = data.match(/^search_page_(\d+)_(.+)$/);
+    // A-Z pagination: az_p_0, az_p_1, ...
+    const azPageMatch = data.match(/^az_p_(\d+)$/);
+    if (azPageMatch) {
+      const page = parseInt(azPageMatch[1]);
+      return await handleAnimeListAZEdit(ctx, page);
+    }
+
+    // Search pagination: search_p_0_naruto
+    const searchPageMatch = data.match(/^search_p_(\d+)_(.+)$/);
     if (searchPageMatch) {
       const page = parseInt(searchPageMatch[1]);
       const query = searchPageMatch[2];
-      await handleSearchEdit(ctx, query, page);
-      return;
+      return await handleSearchEdit(ctx, query, page);
     }
 
-    // --- Detail anime ---
+    // Detail anime
     if (data.startsWith('detail_')) {
-      const animeUrl = data.replace('detail_', '');
-      await handleDetail(ctx, animeUrl);
-      return;
+      const animeUrl = data.substring(7);
+      return await handleDetail(ctx, animeUrl);
     }
 
-    // --- Tonton / Watch ---
-    if (data.startsWith('watch_')) {
-      const animeUrl = data.replace('watch_', '');
-      await handleWatch(ctx, animeUrl);
-      return;
-    }
-
-    // --- Episode list ---
+    // Daftar episode
     if (data.startsWith('episodes_')) {
-      const animeUrl = data.replace('episodes_', '');
-      await handleEpisodeList(ctx, animeUrl);
-      return;
+      const animeUrl = data.substring(9);
+      return await handleEpisodes(ctx, animeUrl);
     }
 
-    // --- Episode video ---
+    // Video episode
     if (data.startsWith('ep_')) {
-      const epUrl = data.replace('ep_', '');
-      await handleEpisodeVideo(ctx, epUrl);
-      return;
+      const epUrl = data.substring(3);
+      return await handleEpisodeVideo(ctx, epUrl);
     }
+
   } catch (err) {
     console.error('Callback error:', err.message);
     try {
@@ -169,18 +240,15 @@ bot.on('callback_query', async (ctx) => {
 });
 
 // ============================================================
-// HANDLER FUNCTIONS
+// HANDLERS
 // ============================================================
 
-/**
- * Fetch & send anime list (new message)
- */
 async function handleAnimeList(ctx, prefix, header, emoji) {
   const loadingMsg = await ctx.reply('⏳ Memuat data...');
   const items = await fetchByPrefix(prefix);
 
-  if (!items) {
-    return ctx.telegram.editMessageText(
+  if (!items || items.length === 0) {
+    return await ctx.telegram.editMessageText(
       ctx.chat.id, loadingMsg.message_id, null,
       '😔 Gagal memuat data. Silakan coba lagi nanti.'
     );
@@ -192,290 +260,360 @@ async function handleAnimeList(ctx, prefix, header, emoji) {
   await ctx.telegram.editMessageText(
     ctx.chat.id, loadingMsg.message_id, null,
     text,
-    { parse_mode: 'MarkdownV2', reply_markup: { inline_keyboard: keyboard } },
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } },
   );
 }
 
-/**
- * Fetch & edit existing message with anime list
- */
 async function handleAnimeListEdit(ctx, prefix, header, emoji, page) {
   const items = await fetchByPrefix(prefix);
-  if (!items) {
-    return ctx.editMessageText('😔 Gagal memuat data. Silakan coba lagi nanti.');
+  if (!items || items.length === 0) {
+    return await editOrReply(ctx, '😔 Gagal memuat data. Silakan coba lagi nanti.');
   }
 
   const text = header + formatAnimeList(items, page, emoji);
   const keyboard = buildAnimeListKeyboard(items, page, prefix);
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'MarkdownV2',
-    reply_markup: { inline_keyboard: keyboard },
-  });
+  await editOrReply(ctx, text, keyboard);
 }
 
-/**
- * Search & send result (new message)
- */
 async function handleSearch(ctx, query, page) {
   const loadingMsg = await ctx.reply(`⏳ Mencari "${query}"...`);
   const items = await api.searchAnime(query);
 
   if (!items || items.length === 0) {
-    return ctx.telegram.editMessageText(
+    return await ctx.telegram.editMessageText(
       ctx.chat.id, loadingMsg.message_id, null,
       `😔 Tidak ditemukan anime dengan judul "${query}".`
     );
   }
 
-  const header = `🔍 *Hasil Pencarian:* _${escapeMarkdown(query)}_\n\n`;
+  const header = `🔍 <b>Hasil Pencarian:</b> <i>${escapeHTML(query)}</i>\n\n`;
   const text = header + formatAnimeList(items, page, '🔍');
   const keyboard = buildAnimeListKeyboard(items, page, 'search', query);
 
   await ctx.telegram.editMessageText(
     ctx.chat.id, loadingMsg.message_id, null,
     text,
-    { parse_mode: 'MarkdownV2', reply_markup: { inline_keyboard: keyboard } },
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } },
   );
 }
 
-/**
- * Search & edit existing message
- */
 async function handleSearchEdit(ctx, query, page) {
   const items = await api.searchAnime(query);
   if (!items || items.length === 0) {
-    return ctx.editMessageText(`😔 Tidak ditemukan anime dengan judul "${query}".`);
+    return await editOrReply(ctx, `😔 Tidak ditemukan anime dengan judul "${query}".`);
   }
 
-  const header = `🔍 *Hasil Pencarian:* _${escapeMarkdown(query)}_\n\n`;
+  const header = `🔍 <b>Hasil Pencarian:</b> <i>${escapeHTML(query)}</i>\n\n`;
   const text = header + formatAnimeList(items, page, '🔍');
   const keyboard = buildAnimeListKeyboard(items, page, 'search', query);
-
-  await ctx.editMessageText(text, {
-    parse_mode: 'MarkdownV2',
-    reply_markup: { inline_keyboard: keyboard },
-  });
+  await editOrReply(ctx, text, keyboard);
 }
 
-/**
- * Show anime detail
- */
-async function handleDetail(ctx, animeUrl) {
-  const detail = await api.getDetail(animeUrl);
+async function handleAnimeListAZ(ctx, page) {
+  const items = api.getAllAnimeAZ();
 
-  if (!detail) {
-    return ctx.editMessageText('😔 Gagal memuat detail anime. Silakan coba lagi.');
-  }
-
-  const text = formatAnimeDetail(detail);
-  const keyboard = buildDetailKeyboard(animeUrl);
-
-  // Jika ada cover image, kirim sebagai foto baru
-  if (detail.cover) {
-    try {
-      // Delete old message
-      await ctx.deleteMessage();
-    } catch (_) {}
-
-    try {
-      await ctx.replyWithPhoto(detail.cover, {
-        caption: text,
-        parse_mode: 'MarkdownV2',
-        reply_markup: { inline_keyboard: keyboard },
-      });
-      return;
-    } catch (err) {
-      console.error('Photo send error:', err.message);
-      // Fallback to text only
-    }
-  }
-
-  // Fallback: text only
-  try {
-    await ctx.editMessageText(text, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: { inline_keyboard: keyboard },
-    });
-  } catch (_) {
-    // If edit fails (e.g. message was photo), send new message
-    await ctx.reply(text, {
-      parse_mode: 'MarkdownV2',
-      reply_markup: { inline_keyboard: keyboard },
-    });
-  }
-}
-
-/**
- * Handle watch — get video link
- */
-async function handleWatch(ctx, animeUrl) {
-  try { await ctx.deleteMessage(); } catch (_) {}
-
-  const loadingMsg = await ctx.reply('⏳ Mengambil link video...');
-  const videoData = await api.getVideo(animeUrl);
-
-  if (!videoData) {
-    return ctx.telegram.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, null,
-      '😔 Gagal mengambil link video. Mungkin video belum tersedia untuk anime ini.',
+  if (!items || items.length === 0) {
+    return await ctx.reply(
+      '📋 <b>Daftar anime masih kosong.</b>\n\n' +
+      'Gunakan <code>/cari</code> untuk mencari anime terlebih dahulu.\n' +
+      'Setiap pencarian akan otomatis menambah daftar A-Z!\n\n' +
+      'Contoh: <code>/cari naruto</code>',
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🏠 Menu Utama', callback_data: 'menu' }]] } },
     );
   }
 
-  // videoData bisa berupa object atau array tergantung API
-  let message = '▶️ *Link Video Tersedia:*\n\n';
-  const keyboard = [[{ text: '🔙 Kembali', callback_data: 'menu' }]];
+  const header = `📋 <b>Daftar Anime A-Z (${items.length} anime):</b>\n\n`;
+  const text = header + formatAnimeListAZ(items, page);
+  const keyboard = buildAnimeListAZKeyboard(items, page);
 
-  if (Array.isArray(videoData)) {
-    // Array of video sources
-    if (videoData.length === 0) {
-      return ctx.telegram.editMessageText(
-        ctx.chat.id, loadingMsg.message_id, null,
-        '😔 Belum ada video tersedia untuk anime ini.',
-      );
-    }
+  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboard } });
+}
 
-    videoData.forEach((v, i) => {
-      const quality = v.quality || v.resolusi || v.label || `Source ${i + 1}`;
-      const url = v.url || v.link || v.src || '';
-      if (url) {
-        message += `🔗 *${escapeMarkdown(String(quality))}:* [Tonton](${escapeMarkdown(url)})\n`;
-      }
-    });
-  } else if (typeof videoData === 'object') {
-    // Object with video info
-    const episodes = videoData.episodes || videoData.episode_list || videoData.data;
-
-    if (episodes && Array.isArray(episodes)) {
-      // Show episode list with buttons
-      message = `📺 *Daftar Episode:*\n\n`;
-      const epKeyboard = [];
-      const maxShow = Math.min(episodes.length, 20);
-
-      for (let i = 0; i < maxShow; i++) {
-        const ep = episodes[i];
-        const epTitle = ep.judul || ep.title || ep.episode || `Episode ${i + 1}`;
-        const epUrl = ep.url || ep.id || '';
-        epKeyboard.push([{
-          text: `📺 ${epTitle}`,
-          callback_data: `ep_${epUrl}`.substring(0, 64),
-        }]);
-      }
-
-      if (episodes.length > 20) {
-        message += `_Menampilkan 20 dari ${episodes.length} episode_\n`;
-      }
-
-      epKeyboard.push([{ text: '🔙 Kembali', callback_data: `detail_${animeUrl}` }]);
-
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, loadingMsg.message_id, null,
-        message,
-        { parse_mode: 'MarkdownV2', reply_markup: { inline_keyboard: epKeyboard } },
-      );
-      return;
-    }
-
-    // Single video URL
-    const url = videoData.url || videoData.link || videoData.src || videoData.video || '';
-    if (url) {
-      message += `🔗 [Tonton Sekarang](${escapeMarkdown(url)})`;
-    } else {
-      // Dump available keys
-      const keys = Object.keys(videoData);
-      if (keys.length > 0) {
-        message = '▶️ *Data Video:*\n\n';
-        keys.forEach(key => {
-          const val = videoData[key];
-          if (typeof val === 'string' && val.startsWith('http')) {
-            message += `🔗 *${escapeMarkdown(key)}:* [Link](${escapeMarkdown(val)})\n`;
-          } else if (typeof val === 'string') {
-            message += `📝 *${escapeMarkdown(key)}:* ${escapeMarkdown(val)}\n`;
-          }
-        });
-      } else {
-        message = '😔 Format video tidak dikenali\\.';
-      }
-    }
-  } else if (typeof videoData === 'string' && videoData.startsWith('http')) {
-    message += `🔗 [Tonton Sekarang](${escapeMarkdown(videoData)})`;
-  } else {
-    message = '😔 Format video tidak dikenali\\.';
+async function handleAnimeListAZEdit(ctx, page) {
+  const items = api.getAllAnimeAZ();
+  if (!items || items.length === 0) {
+    return await editOrReply(ctx,
+      '📋 <b>Daftar anime masih kosong.</b>\n\n' +
+      'Gunakan <code>/cari</code> untuk mencari anime.\nSetiap pencarian otomatis menambah daftar A-Z!',
+      [[{ text: '🏠 Menu Utama', callback_data: 'menu' }]],
+    );
   }
 
-  await ctx.telegram.editMessageText(
-    ctx.chat.id, loadingMsg.message_id, null,
-    message,
-    { parse_mode: 'MarkdownV2', reply_markup: { inline_keyboard: keyboard } },
-  );
+  const header = `📋 <b>Daftar Anime A-Z (${items.length} anime):</b>\n\n`;
+  const text = header + formatAnimeListAZ(items, page);
+  const keyboard = buildAnimeListAZKeyboard(items, page);
+  await editOrReply(ctx, text, keyboard);
 }
 
 /**
- * Handle episode list
+ * Tampilkan detail anime dengan poster (download dulu baru upload)
  */
-async function handleEpisodeList(ctx, animeUrl) {
-  const videoData = await api.getVideo(animeUrl);
-  if (!videoData) {
-    return ctx.editMessageText('😔 Gagal memuat daftar episode.');
-  }
-  // Redirect to watch handler logic
-  await handleWatch(ctx, animeUrl);
-}
+async function handleDetail(ctx, animeUrl) {
+  try { await ctx.deleteMessage(); } catch (_) {}
 
-/**
- * Handle episode video
- */
-async function handleEpisodeVideo(ctx, epUrl) {
-  const loadingText = '⏳ Mengambil link episode\\.\\.\\.';
-  try {
-    await ctx.editMessageText(loadingText, { parse_mode: 'MarkdownV2' });
-  } catch (_) {}
+  console.log('[Detail] urlId:', animeUrl, 'len:', animeUrl.length);
+  const loadingMsg = await ctx.reply('⏳ Memuat detail anime...');
+  const detail = await api.getDetail(animeUrl);
 
-  const videoData = await api.getVideo(epUrl);
-
-  if (!videoData) {
-    return ctx.editMessageText('😔 Gagal mengambil link video episode.');
+  if (!detail) {
+    console.log('[Detail] FAILED for urlId:', animeUrl);
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Gagal memuat detail anime. Silakan coba lagi.',
+    );
   }
 
-  let message = '▶️ *Link Episode:*\n\n';
-  const keyboard = [[{ text: '🔙 Kembali', callback_data: 'menu' }]];
+  const text = formatAnimeDetail(detail);
+  const hasChapters = detail.chapter && detail.chapter.length > 0;
+  const keyboard = buildDetailKeyboard(animeUrl, hasChapters);
 
-  if (Array.isArray(videoData)) {
-    videoData.forEach((v, i) => {
-      const quality = v.quality || v.resolusi || v.label || `Source ${i + 1}`;
-      const url = v.url || v.link || v.src || '';
-      if (url) {
-        message += `🔗 *${escapeMarkdown(String(quality))}:* [Tonton](${escapeMarkdown(url)})\n`;
+  // Hapus loading msg
+  try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+
+  // Coba kirim poster: download dulu, baru upload ke Telegram
+  const cover = detail.cover || '';
+  if (cover) {
+    try {
+      const imgData = await downloadFile(cover, 10); // max 10MB for image
+      if (imgData && imgData.buffer) {
+        await ctx.replyWithPhoto(
+          Input.fromBuffer(imgData.buffer, 'cover.jpg'),
+          {
+            caption: text,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard },
+          },
+        );
+        return;
       }
-    });
-  } else if (typeof videoData === 'object') {
-    const url = videoData.url || videoData.link || videoData.src || videoData.video || '';
-    if (url) {
-      message += `🔗 [Tonton Sekarang](${escapeMarkdown(url)})`;
-    } else {
-      const keys = Object.keys(videoData);
-      keys.forEach(key => {
-        const val = videoData[key];
-        if (typeof val === 'string' && val.startsWith('http')) {
-          message += `🔗 *${escapeMarkdown(key)}:* [Link](${escapeMarkdown(val)})\n`;
-        }
+    } catch (err) {
+      console.error('Photo download/upload error:', err.message);
+    }
+
+    // Fallback: coba kirim URL langsung
+    try {
+      await ctx.replyWithPhoto(cover, {
+        caption: text,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: keyboard },
       });
-    }
+      return;
+    } catch (_) {}
   }
 
-  await ctx.editMessageText(message, {
-    parse_mode: 'MarkdownV2',
+  // Fallback: text saja
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
     reply_markup: { inline_keyboard: keyboard },
   });
 }
 
-// ============================================================
-// UTILITY
-// ============================================================
+async function handleEpisodes(ctx, animeUrl) {
+  try { await ctx.deleteMessage(); } catch (_) {}
+
+  const loadingMsg = await ctx.reply('⏳ Memuat daftar episode...');
+  const detail = await api.getDetail(animeUrl);
+
+  if (!detail || !detail.chapter || detail.chapter.length === 0) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Tidak ada episode tersedia untuk anime ini.',
+    );
+  }
+
+  const title = escapeHTML(detail.judul || animeUrl);
+  const chapters = detail.chapter;
+  let text = `📺 <b>Daftar Episode: ${title}</b>\n\nTotal: ${chapters.length} episode`;
+  if (chapters.length > 20) {
+    text += `\n<i>Menampilkan 20 episode terbaru</i>`;
+  }
+
+  const keyboard = buildEpisodeKeyboard(chapters, animeUrl);
+
+  try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
 
 /**
- * Fetch data by prefix type
+ * Ambil video episode — smart quality selection + download & upload
+ *
+ * Flow:
+ * 1. GET /getvideo?chapterUrlId=xxx → dapat reso: ["360p","480p","720p"]
+ * 2. Coba setiap quality dari kecil ke besar, cek ukuran file dulu (HEAD)
+ * 3. Jika ≤50MB → download & upload ke Telegram
+ * 4. Jika >50MB → kirim link download langsung
  */
+async function handleEpisodeVideo(ctx, epUrl) {
+  try { await ctx.deleteMessage(); } catch (_) {}
+
+  const loadingMsg = await ctx.reply('⏳ Mengambil info video...');
+  const menuKeyboard = [[{ text: '🏠 Menu Utama', callback_data: 'menu' }]];
+
+  // Step 1: Ambil info quality yang tersedia
+  const videoInfo = await api.getVideo(epUrl);
+
+  if (!videoInfo) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Gagal mengambil video. Mungkin video belum tersedia.',
+    );
+  }
+
+  const qualities = videoInfo.reso || [];
+
+  if (qualities.length === 0) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Belum ada video tersedia untuk episode ini.',
+    );
+  }
+
+  // Prioritas: coba dari quality terbaik yang bisa dikirim
+  const preferred = ['720p', '480p', '360p', '1080p'];
+  const availableQualities = preferred.filter(q => qualities.includes(q));
+  if (availableQualities.length === 0) availableQualities.push(...qualities);
+
+  console.log(`Available qualities: [${qualities.join(', ')}]`);
+
+  // Step 2: Cari quality yang punya stream link
+  let streamLink = null;
+  let chosenQuality = null;
+
+  for (const q of availableQualities) {
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id, loadingMsg.message_id, null,
+        `⏳ Mencari video ${q}...`,
+      ).catch(() => {});
+
+      const videoData = await api.getVideo(epUrl, q);
+      if (videoData && videoData.stream && videoData.stream.length > 0 && videoData.stream[0].link) {
+        streamLink = videoData.stream[0].link;
+        chosenQuality = q;
+        break;
+      }
+    } catch (_) {}
+  }
+
+  if (!streamLink) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Tidak ada link video tersedia saat ini.',
+    );
+  }
+
+  console.log(`Chosen: ${chosenQuality}, URL: ${streamLink}`);
+
+  // Step 3: Cek ukuran file dulu (HEAD request) — jangan download sia-sia
+  let fileSize = 0;
+  try {
+    const headRes = await fetch(streamLink, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      redirect: 'follow',
+    });
+    fileSize = parseInt(headRes.headers.get('content-length') || '0');
+  } catch (_) {}
+
+  const fileSizeStr = fileSize > 0 ? formatSize(fileSize) : 'Unknown';
+  const MAX_TELEGRAM_SIZE = MAX_UPLOAD_MB * 1024 * 1024;
+
+  console.log(`File size: ${fileSizeStr} (${fileSize} bytes)`);
+
+  // Jika file >50MB, langsung kirim link (jangan download sia-sia)
+  if (fileSize > MAX_TELEGRAM_SIZE) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `▶️ <b>Video ${escapeHTML(chosenQuality)}</b> | ${fileSizeStr}\n\n` +
+      `⚠️ File terlalu besar untuk Telegram (max 50MB).\n\n` +
+      `🔗 <a href="${escapeHTML(streamLink)}">📥 Download / Tonton di Browser</a>\n\n` +
+      `<i>💡 Deploy bot di VPS dengan Local Bot API Server untuk support file sampai 2GB.</i>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: menuKeyboard } },
+    );
+  }
+
+  // Step 4: Download video
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `⏳ Mendownload video (${chosenQuality}, ${fileSizeStr})...\nMohon tunggu sebentar.`,
+    );
+  } catch (_) {}
+
+  const videoFile = await downloadFile(streamLink, MAX_UPLOAD_MB);
+
+  if (!videoFile || !videoFile.buffer) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `😔 Gagal mendownload video.\n\n🔗 <a href="${escapeHTML(streamLink)}">📥 Download di Browser</a>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: menuKeyboard } },
+    );
+  }
+
+  const actualSizeStr = formatSize(videoFile.size);
+
+  // Step 5: Upload ke Telegram
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `⏳ Mengirim video (${chosenQuality}, ${actualSizeStr})...\nSedang upload ke Telegram...`,
+    );
+  } catch (_) {}
+
+  const fileName = `anime_${chosenQuality}.mp4`;
+
+  // Coba kirim sebagai video
+  try {
+    await ctx.replyWithVideo(
+      Input.fromBuffer(videoFile.buffer, fileName),
+      {
+        caption: `▶️ <b>${escapeHTML(chosenQuality)}</b> | ${actualSizeStr}`,
+        parse_mode: 'HTML',
+        supports_streaming: true,
+        reply_markup: { inline_keyboard: menuKeyboard },
+      },
+    );
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+    console.log(`✅ Video sent: ${chosenQuality} (${actualSizeStr})`);
+    return;
+  } catch (err) {
+    console.error('Video upload error:', err.message);
+
+    // Fallback: kirim sebagai document
+    try {
+      await ctx.replyWithDocument(
+        Input.fromBuffer(videoFile.buffer, fileName),
+        {
+          caption: `▶️ <b>${escapeHTML(chosenQuality)}</b> | ${actualSizeStr}\n<i>Dikirim sebagai file</i>`,
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: menuKeyboard },
+        },
+      );
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+      console.log(`✅ Video sent as document: ${chosenQuality} (${actualSizeStr})`);
+      return;
+    } catch (docErr) {
+      console.error('Document upload error:', docErr.message);
+    }
+  }
+
+  // Fallback terakhir: kirim link
+  await ctx.telegram.editMessageText(
+    ctx.chat.id, loadingMsg.message_id, null,
+    `▶️ <b>Video ${escapeHTML(chosenQuality)}</b> | ${actualSizeStr}\n\n` +
+    `⚠️ Gagal upload ke Telegram.\n` +
+    `🔗 <a href="${escapeHTML(streamLink)}">📥 Download / Tonton di Browser</a>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: menuKeyboard } },
+  );
+}
+
+// ============================================================
+// UTILITIES
+// ============================================================
+
 async function fetchByPrefix(prefix) {
   switch (prefix) {
     case 'latest': return api.getLatest();
@@ -485,9 +623,20 @@ async function fetchByPrefix(prefix) {
   }
 }
 
-/**
- * Error handler
- */
+async function editOrReply(ctx, text, keyboard = []) {
+  const opts = { parse_mode: 'HTML' };
+  if (keyboard && keyboard.length > 0) {
+    opts.reply_markup = { inline_keyboard: keyboard };
+  }
+
+  try {
+    await ctx.editMessageText(text, opts);
+  } catch (err) {
+    try { await ctx.deleteMessage(); } catch (_) {}
+    await ctx.reply(text, opts);
+  }
+}
+
 bot.catch((err, ctx) => {
   console.error('Bot error:', err.message);
   try {
