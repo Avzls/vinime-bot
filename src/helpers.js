@@ -279,6 +279,136 @@ function getWelcomeMessage() {
     `Atau gunakan tombol di bawah ini 👇`;
 }
 
+/**
+ * Buat inline keyboard navigasi episode (Prev/Next + Download + Menu)
+ * @param {string} animeUrl - Full URL anime
+ * @param {number} currentIdx - Index episode saat ini (0-based)
+ * @param {number} total - Total episode
+ * @param {string} epUrl - URL episode saat ini untuk tombol download
+ */
+function buildEpisodeNavKeyboard(animeUrl, currentIdx, total, epUrl) {
+  const keyboard = [];
+
+  // Buat slug dari animeUrl untuk callback_data
+  let slug = animeUrl;
+  try {
+    const urlObj = new URL(animeUrl);
+    slug = urlObj.pathname;
+  } catch (_) {}
+
+  // Navigasi Prev / Next
+  const navRow = [];
+  if (currentIdx > 0) {
+    const prevData = `epnav_${slug}__${currentIdx - 1}`.substring(0, 64);
+    navRow.push({ text: '◀️ Ep Sebelumnya', callback_data: prevData });
+  }
+  if (currentIdx < total - 1) {
+    const nextData = `epnav_${slug}__${currentIdx + 1}`.substring(0, 64);
+    navRow.push({ text: 'Ep Berikutnya ▶️', callback_data: nextData });
+  }
+  if (navRow.length > 0) keyboard.push(navRow);
+
+  // Tombol download langsung
+  if (epUrl) {
+    keyboard.push([{
+      text: '📥 Download Episode Ini',
+      callback_data: `ep_${epUrl}`.substring(0, 64),
+    }]);
+  }
+
+  // Tombol kembali ke daftar episode + menu utama
+  keyboard.push([{ text: '📋 Daftar Episode', callback_data: `episodes_${animeUrl}`.substring(0, 64) }]);
+  keyboard.push([{ text: '🏠 Menu Utama', callback_data: 'menu' }]);
+
+  return keyboard;
+}
+
+/**
+ * Buat inline keyboard daftar genre (3 kolom)
+ * @param {Array} genres - Array genre [{name, slug} atau {name, url}]
+ */
+function buildGenreListKeyboard(genres) {
+  if (!genres || genres.length === 0) return [];
+
+  const keyboard = [];
+  const cols = 3;
+
+  for (let i = 0; i < genres.length; i += cols) {
+    const row = [];
+    for (let j = 0; j < cols && i + j < genres.length; j++) {
+      const g = genres[i + j];
+      const name = g.name || g.judul || g.title || String(g);
+      const slug = g.slug || g.url || name.toLowerCase().replace(/\s+/g, '-');
+      row.push({
+        text: name,
+        callback_data: `genre_${slug}_p_0`.substring(0, 64),
+      });
+    }
+    keyboard.push(row);
+  }
+
+  keyboard.push([{ text: '🏠 Menu Utama', callback_data: 'menu' }]);
+  return keyboard;
+}
+
+/**
+ * Format daftar anime per genre (HTML)
+ * @param {Array} items - Daftar anime
+ * @param {string} slug - Slug genre
+ * @param {number} currentPage - Halaman saat ini (1-based dari API)
+ * @param {number} totalPages - Total halaman
+ */
+function formatGenreAnimeList(items, slug, currentPage, totalPages) {
+  if (!items || items.length === 0) {
+    return '😔 Tidak ada anime untuk genre ini.';
+  }
+
+  let msg = `🎭 <b>Genre: ${escapeHTML(slug)}</b>
+
+`;
+  items.forEach((item, idx) => {
+    const title = escapeHTML(item.judul || item.title || 'Tanpa Judul');
+    const ep = item.lastch ? ` | ${escapeHTML(item.lastch)}` : '';
+    msg += `🎬 <b>${idx + 1}. ${title}</b>${ep}
+`;
+  });
+
+  msg += `
+📄 <i>Halaman ${currentPage} dari ${totalPages}</i>`;
+  return msg;
+}
+
+/**
+ * Buat inline keyboard untuk navigasi daftar anime per genre
+ * @param {string} slug - Slug genre
+ * @param {number} currentPage - Halaman saat ini (1-based)
+ * @param {number} totalPages - Total halaman
+ */
+function buildGenreAnimeKeyboard(slug, currentPage, totalPages) {
+  const keyboard = [];
+
+  const navRow = [];
+  if (currentPage > 1) {
+    navRow.push({
+      text: '◀️ Prev',
+      callback_data: `genre_${slug}_p_${currentPage - 1}`.substring(0, 64),
+    });
+  }
+  navRow.push({ text: `${currentPage}/${totalPages}`, callback_data: 'noop' });
+  if (currentPage < totalPages) {
+    navRow.push({
+      text: 'Next ▶️',
+      callback_data: `genre_${slug}_p_${currentPage + 1}`.substring(0, 64),
+    });
+  }
+  if (navRow.length > 0) keyboard.push(navRow);
+
+  keyboard.push([{ text: '🎭 Pilih Genre Lain', callback_data: 'cmd_genre' }]);
+  keyboard.push([{ text: '🏠 Menu Utama', callback_data: 'menu' }]);
+
+  return keyboard;
+}
+
 module.exports = {
   PER_PAGE,
   PER_PAGE_AZ,
@@ -291,7 +421,11 @@ module.exports = {
   buildAnimeListKeyboard,
   buildAnimeListAZKeyboard,
   buildEpisodeKeyboard,
+  buildEpisodeNavKeyboard,
   buildDetailKeyboard,
+  buildGenreListKeyboard,
+  formatGenreAnimeList,
+  buildGenreAnimeKeyboard,
   buildMainMenuKeyboard,
   getWelcomeMessage,
 };
