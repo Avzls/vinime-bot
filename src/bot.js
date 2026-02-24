@@ -22,6 +22,7 @@ const {
   buildGenreListKeyboard,
   formatGenreAnimeList,
   buildGenreAnimeKeyboard,
+  buildMainMenuKeyboard,
   getWelcomeMessage,
   escapeHTML,
 } = require('./helpers');
