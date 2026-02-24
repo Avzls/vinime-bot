@@ -17,8 +17,11 @@ const {
   buildAnimeListKeyboard,
   buildAnimeListAZKeyboard,
   buildEpisodeKeyboard,
+  buildEpisodeNavKeyboard,
   buildDetailKeyboard,
-  buildMainMenuKeyboard,
+  buildGenreListKeyboard,
+  formatGenreAnimeList,
+  buildGenreAnimeKeyboard,
   getWelcomeMessage,
   escapeHTML,
 } = require('./helpers');
@@ -148,6 +151,10 @@ bot.command('cari', async (ctx) => {
   await handleSearch(ctx, query, 0);
 });
 
+bot.command('genre', async (ctx) => {
+  await handleGenreList(ctx);
+});
+
 // ============================================================
 // CALLBACK QUERIES
 // ============================================================
@@ -213,6 +220,19 @@ bot.on('callback_query', async (ctx) => {
       return await handleSearchEdit(ctx, query, page);
     }
 
+    // Genre list: cmd_genre
+    if (data === 'cmd_genre') {
+      return await handleGenreListEdit(ctx);
+    }
+
+    // Genre anime list: genre_action_p_0
+    const genrePageMatch = data.match(/^genre_([^_]+(?:_[^_]+)*)_p_(\d+)$/);
+    if (genrePageMatch) {
+      const slug = genrePageMatch[1];
+      const page = parseInt(genrePageMatch[2]);
+      return await handleGenreAnimeEdit(ctx, slug, page);
+    }
+
     // Detail anime
     if (data.startsWith('detail_')) {
       const animeUrl = data.substring(7);
@@ -231,6 +251,19 @@ bot.on('callback_query', async (ctx) => {
       return await handleEpisodeVideo(ctx, epUrl);
     }
 
+    // Navigasi episode: epnav_<animeSlug>__<idx>
+    if (data.startsWith('epnav_')) {
+      const rest = data.substring(6); // hapus 'epnav_'
+      const sep = rest.lastIndexOf('__');
+      if (sep !== -1) {
+        const animeSlug = rest.substring(0, sep);
+        const idx = parseInt(rest.substring(sep + 2));
+        // Reconstruct full animeUrl dari slug
+        const animeUrl = animeSlug.startsWith('http') ? animeSlug : `https://otakudesu.cloud${animeSlug}`;
+        return await handleEpisodeByIndex(ctx, animeUrl, idx);
+      }
+    }
+
   } catch (err) {
     console.error('Callback error:', err.message);
     try {
@@ -240,6 +273,54 @@ bot.on('callback_query', async (ctx) => {
 });
 
 // ============================================================
+async function handleGenreList(ctx) {
+  const loadingMsg = await ctx.reply('⏳ Memuat daftar genre...');
+  const genres = await api.getGenreList();
+  if (!genres || genres.length === 0) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Gagal memuat genre. Coba lagi nanti.'
+    );
+  }
+  const text = `<b>🎭 Pilih Genre</b>
+
+Pilih genre anime yang ingin kamu jelajahi:`;
+  await ctx.telegram.editMessageText(
+    ctx.chat.id, loadingMsg.message_id, null, text,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: buildGenreListKeyboard(genres) } }
+  );
+}
+
+async function handleGenreListEdit(ctx) {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('⏳ Memuat daftar genre...');
+  const genres = await api.getGenreList();
+  if (!genres || genres.length === 0) {
+    return await ctx.editMessageText('😔 Gagal memuat genre. Coba lagi nanti.');
+  }
+  const text = `<b>🎭 Pilih Genre</b>
+
+Pilih genre anime yang ingin kamu jelajahi:`;
+  await ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buildGenreListKeyboard(genres) },
+  });
+}
+
+async function handleGenreAnimeEdit(ctx, slug, page) {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('⏳ Memuat anime...');
+  const result = await api.getAnimeByGenre(slug, page);
+  const text = formatGenreAnimeList(result.items, slug, result.currentPage, result.totalPages);
+  await ctx.editMessageText(text, {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: buildGenreAnimeKeyboard(slug, result.currentPage, result.totalPages),
+    },
+  });
+}
+
 // HANDLERS
 // ============================================================
 
@@ -438,6 +519,203 @@ async function handleEpisodes(ctx, animeUrl) {
 }
 
 /**
+ * Navigasi episode berdasarkan index di chapter list
+ * Dipakai oleh callback epnav_<animeSlug>__<idx>
+ */
+async function handleEpisodeByIndex(ctx, animeUrl, idx) {
+  try { await ctx.deleteMessage(); } catch (_) {}
+
+  const loadingMsg = await ctx.reply('⏳ Memuat episode...');
+
+  const detail = await api.getDetail(animeUrl);
+  if (!detail || !detail.chapter || detail.chapter.length === 0) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Gagal memuat data episode. Silakan coba lagi.',
+    );
+  }
+
+  const chapters = detail.chapter;
+  const safeIdx = Math.max(0, Math.min(idx, chapters.length - 1));
+  const ep = chapters[safeIdx];
+
+  if (!ep || !ep.url) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      '😔 Episode tidak ditemukan.',
+    );
+  }
+
+  const epUrl = ep.url;
+  const epTitle = escapeHTML(ep.ch || `Episode ${safeIdx + 1}`);
+  const animeTitle = escapeHTML(detail.judul || '');
+
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `⏳ Memuat <b>${epTitle}</b>...`,
+      { parse_mode: 'HTML' },
+    );
+  } catch (_) {}
+
+  const videoInfo = await api.getVideo(epUrl);
+  const navKeyboard = buildEpisodeNavKeyboard(animeUrl, safeIdx, chapters.length, epUrl);
+
+  if (!videoInfo) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `😔 Gagal mengambil video untuk <b>${epTitle}</b>.\n\nCoba episode lain.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+    );
+  }
+
+  const qualities = videoInfo.reso || [];
+  if (qualities.length === 0) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `😔 Belum ada video untuk <b>${epTitle}</b>.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+    );
+  }
+
+  function resolveDirectLink(entry) {
+    if (!entry || !entry.link) return null;
+    const link = entry.link;
+    const pdMatch = link.match(/pixeldrain\.com\/u\/([A-Za-z0-9]+)/);
+    if (pdMatch) return `https://pixeldrain.com/api/file/${pdMatch[1]}`;
+    const skipPatterns = [
+      /\.html?($|\?)/i, /mega\.nz/i, /gofile\.io/i, /acefile\.co/i, /krakenfiles\.com/i,
+    ];
+    if (skipPatterns.some(p => p.test(link))) return null;
+    return link;
+  }
+
+  const preferred = ['720p', '480p', '360p', '1080p'];
+  const availableQualities = preferred.filter(q => qualities.includes(q));
+  if (availableQualities.length === 0) availableQualities.push(...qualities);
+
+  let streamLink = null;
+  let chosenQuality = null;
+  for (const q of availableQualities) {
+    const streamsForQ = videoInfo.stream.filter(s => s.reso === q && !s.isEmbed);
+    for (const entry of streamsForQ) {
+      const direct = resolveDirectLink(entry);
+      if (direct) { streamLink = direct; chosenQuality = q; break; }
+    }
+    if (streamLink) break;
+  }
+
+  if (!streamLink) {
+    const linkLines = videoInfo.stream
+      .filter(s => s.link && !s.isEmbed)
+      .slice(0, 8)
+      .map(s => `• <a href="${escapeHTML(s.link)}">${escapeHTML(s.provider)} (${s.reso})</a>`)
+      .join('\n');
+    const fallbackText = linkLines
+      ? `📺 <b>${animeTitle}</b> — <b>${epTitle}</b>\n\n📥 <b>Link Download:</b>\n${linkLines}\n\n<i>Buka di browser untuk download.</i>`
+      : `😔 Tidak ada link video untuk <b>${epTitle}</b>.`;
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      fallbackText,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+    );
+  }
+
+  // Cek ukuran file
+  let fileSize = 0;
+  try {
+    const headRes = await fetch(streamLink, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      redirect: 'follow',
+    });
+    fileSize = parseInt(headRes.headers.get('content-length') || '0');
+  } catch (_) {}
+
+  const fileSizeStr = fileSize > 0 ? formatSize(fileSize) : 'Unknown';
+  const MAX_TELEGRAM_SIZE = MAX_UPLOAD_MB * 1024 * 1024;
+
+  if (fileSize > MAX_TELEGRAM_SIZE) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `📺 <b>${animeTitle}</b>\n` +
+      `▶️ <b>${epTitle}</b> | ${escapeHTML(chosenQuality)} | ${fileSizeStr}\n\n` +
+      `⚠️ File terlalu besar untuk Telegram (max ${MAX_UPLOAD_MB}MB).\n\n` +
+      `🔗 <a href="${escapeHTML(streamLink)}">📥 Download / Tonton di Browser</a>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+    );
+  }
+
+  // Download video
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `⏳ Mendownload <b>${epTitle}</b> (${chosenQuality}, ${fileSizeStr})...`,
+      { parse_mode: 'HTML' },
+    );
+  } catch (_) {}
+
+  const videoFile = await downloadFile(streamLink, MAX_UPLOAD_MB);
+
+  if (!videoFile || !videoFile.buffer) {
+    return await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `😔 Gagal mendownload <b>${epTitle}</b>.\n\n🔗 <a href="${escapeHTML(streamLink)}">📥 Download di Browser</a>`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+    );
+  }
+
+  const actualSizeStr = formatSize(videoFile.size);
+
+  try {
+    await ctx.telegram.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, null,
+      `⏳ Upload <b>${epTitle}</b> (${chosenQuality}, ${actualSizeStr})...`,
+      { parse_mode: 'HTML' },
+    );
+  } catch (_) {}
+
+  const fileName = `${detail.judul || 'anime'}_${ep.ch || safeIdx}_${chosenQuality}.mp4`.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  try {
+    await ctx.replyWithVideo(
+      Input.fromBuffer(videoFile.buffer, fileName),
+      {
+        caption: `📺 <b>${animeTitle}</b>\n▶️ <b>${epTitle}</b> | ${escapeHTML(chosenQuality)} | ${actualSizeStr}`,
+        parse_mode: 'HTML',
+        supports_streaming: true,
+        reply_markup: { inline_keyboard: navKeyboard },
+      },
+    );
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+    return;
+  } catch (err) {
+    console.error('Video upload error:', err.message);
+    try {
+      await ctx.replyWithDocument(
+        Input.fromBuffer(videoFile.buffer, fileName),
+        {
+          caption: `📺 <b>${animeTitle}</b>\n▶️ <b>${epTitle}</b> | ${escapeHTML(chosenQuality)} | ${actualSizeStr}\n<i>Dikirim sebagai file</i>`,
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: navKeyboard },
+        },
+      );
+      try { await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id); } catch (_) {}
+      return;
+    } catch (docErr) {
+      console.error('Document upload error:', docErr.message);
+    }
+  }
+
+  // Fallback terakhir: link
+  await ctx.telegram.editMessageText(
+    ctx.chat.id, loadingMsg.message_id, null,
+    `📺 <b>${animeTitle}</b>\n▶️ <b>${epTitle}</b> | ${escapeHTML(chosenQuality)}\n\n⚠️ Gagal upload.\n🔗 <a href="${escapeHTML(streamLink)}">📥 Download di Browser</a>`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: navKeyboard } },
+  );
+}
+
+/**
  * Ambil video episode — smart quality selection + download & upload
  *
  * Flow:
@@ -471,37 +749,68 @@ async function handleEpisodeVideo(ctx, epUrl) {
     );
   }
 
+  // Helper: resolve a stream entry's link to a direct downloadable URL
+  // Returns null if not downloadable directly
+  function resolveDirectLink(entry) {
+    if (!entry || !entry.link) return null;
+    const link = entry.link;
+    // Pixeldrain: convert /u/{id} → /api/file/{id} (direct download)
+    const pdMatch = link.match(/pixeldrain\.com\/u\/([A-Za-z0-9]+)/);
+    if (pdMatch) return `https://pixeldrain.com/api/file/${pdMatch[1]}`;
+    // Skip pages that are not direct media (HTML download pages)
+    const skipPatterns = [
+      /\.html?($|\?)/i,
+      /mega\.nz/i,
+      /gofile\.io/i,
+      /acefile\.co/i,
+      /krakenfiles\.com/i,
+    ];
+    if (skipPatterns.some(p => p.test(link))) return null;
+    // Looks like a direct link (e.g. ends in .mp4 or has video CDN)
+    return link;
+  }
   // Prioritas: coba dari quality terbaik yang bisa dikirim
   const preferred = ['720p', '480p', '360p', '1080p'];
   const availableQualities = preferred.filter(q => qualities.includes(q));
   if (availableQualities.length === 0) availableQualities.push(...qualities);
-
   console.log(`Available qualities: [${qualities.join(', ')}]`);
 
-  // Step 2: Cari quality yang punya stream link
+  // Step 2: Cari quality yang punya direct stream link
+  // Use streams dari videoInfo yang sudah ada — tidak perlu fetch ulang
   let streamLink = null;
   let chosenQuality = null;
-
   for (const q of availableQualities) {
-    try {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id, loadingMsg.message_id, null,
-        `⏳ Mencari video ${q}...`,
-      ).catch(() => {});
-
-      const videoData = await api.getVideo(epUrl, q);
-      if (videoData && videoData.stream && videoData.stream.length > 0 && videoData.stream[0].link) {
-        streamLink = videoData.stream[0].link;
+    const streamsForQ = videoInfo.stream.filter(s => s.reso === q && !s.isEmbed);
+    for (const entry of streamsForQ) {
+      const direct = resolveDirectLink(entry);
+      if (direct) {
+        streamLink = direct;
         chosenQuality = q;
+        console.log(`Resolved: ${q} via ${entry.provider} → ${direct.substring(0, 80)}`);
         break;
       }
-    } catch (_) {}
+    }
+    if (streamLink) break;
   }
-
   if (!streamLink) {
+    // Fallback: kirim semua download links sebagai teks
+    const linkLines = videoInfo.stream
+      .filter(s => s.link && !s.isEmbed)
+      .slice(0, 10)
+      .map(s => `• <a href="${escapeHTML(s.link)}">${escapeHTML(s.provider)} (${s.reso})</a>`)
+      .join('\n');
+    const fallbackText = linkLines
+      ? `😔 Tidak bisa download otomatis.
+
+📥 <b>Link Download:</b>
+${linkLines}
+
+<i>Buka di browser untuk download.</i>`
+      : '😔 Tidak ada link video tersedia saat ini.';
     return await ctx.telegram.editMessageText(
       ctx.chat.id, loadingMsg.message_id, null,
-      '😔 Tidak ada link video tersedia saat ini.',
+      fallbackText,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: menuKeyboard } },
     );
   }
 
